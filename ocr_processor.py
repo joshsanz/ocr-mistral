@@ -9,11 +9,13 @@ import base64
 import logging
 import time
 import tempfile
+import random
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Callable
 from io import BytesIO
 
 from mistralai import Mistral
+from dotenv import load_dotenv
 from PyPDF2 import PdfMerger, PdfReader
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -26,17 +28,152 @@ from reportlab.platypus import (
 from reportlab.lib import colors
 from PIL import Image
 
+# Configure logging with colors
+import coloredlogs
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+
+# Add colored logging
+coloredlogs.install(
+    level='INFO',
+    logger=logging.getLogger(),
+    fmt='%(asctime)s - %(levelname)s - %(message)s',
+    level_styles={
+        'debug': {'color': 'cyan'},
+        'info': {'color': 'green'},
+        'warning': {'color': 'yellow'},
+        'error': {'color': 'red', 'bold': True},
+        'critical': {'color': 'red', 'background': 'white'}
+    },
+    field_styles={
+        'asctime': {'color': 'blue'},
+        'levelname': {'bold': True}
+    }
+)
+
 logger = logging.getLogger(__name__)
+
+
+def retry_api_call(
+    func: Callable,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 4.0,
+    retryable_exceptions: tuple = (Exception,),
+    **kwargs
+) -> Any:
+    """
+    Retry a function call with exponential backoff.
+
+    Args:
+        func: Function to call
+        max_retries: Maximum number of retry attempts
+        base_delay: Base delay in seconds for exponential backoff
+        max_delay: Maximum delay between retries
+        retryable_exceptions: Tuple of exception types that should trigger retries
+        **kwargs: Arguments to pass to the function
+
+    Returns:
+        Result of the function call
+
+    Raises:
+        Exception: The last exception if all retries fail
+    """
+    last_exception = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            return func(**kwargs)
+        except retryable_exceptions as e:
+            last_exception = e
+            if attempt < max_retries:
+                # Exponential backoff with jitter
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                jitter = random.uniform(0, delay * 0.1)  # Add 10% jitter
+                total_delay = delay + jitter
+
+                logger.warning(
+                    f"Attempt {attempt + 1} failed: {str(e)}. "
+                    f"Retrying in {total_delay:.2f} seconds..."
+                )
+                time.sleep(total_delay)
+            continue
+
+    logger.error(f"All {max_retries} retry attempts failed")
+    raise last_exception
+
+
+class FailureTracker:
+    """Track failed files and retry attempts for comprehensive reporting."""
+
+    def __init__(self):
+        self.failed_files = []
+        self.retry_attempts = {}
+
+    def report_failure(self, file_path: str, error: Exception, attempt: int = 0):
+        """Report a failure for a specific file."""
+        failure_info = {
+            'file_path': file_path,
+            'error_type': type(error).__name__,
+            'error_message': str(error),
+            'attempt': attempt,
+            'timestamp': time.time()
+        }
+
+        # Track retry attempts
+        if file_path not in self.retry_attempts:
+            self.retry_attempts[file_path] = []
+
+        self.retry_attempts[file_path].append(failure_info)
+
+        # Only add to final failed list if this is the last attempt
+        if attempt >= 3:  # Assuming max 3 retries
+            self.failed_files.append(failure_info)
+
+    def generate_report(self) -> Dict:
+        """Generate a comprehensive failure report."""
+        return {
+            'total_failed_files': len(self.failed_files),
+            'failed_files': self.failed_files,
+            'retry_statistics': {
+                file_path: len(attempts)
+                for file_path, attempts in self.retry_attempts.items()
+            }
+        }
+
+    def save_report(self, report_path: str):
+        """Save failure report to JSON file."""
+        report = self.generate_report()
+        with open(report_path, 'w') as f:
+            json.dump(report, f, indent=2)
+        logger.info(f"Failure report saved to: {report_path}")
+
+    def log_summary(self):
+        """Log a summary of failures."""
+        if not self.failed_files:
+            logger.info("All files processed successfully!")
+            return
+
+        logger.error(f"Processing completed with {len(self.failed_files)} failed files:")
+        for failure in self.failed_files:
+            logger.error(f"  - {failure['file_path']}: {failure['error_type']} - {failure['error_message']}")
+
+# Load environment variables from .env file if present
+# Uses explicit path to work regardless of current working directory
+env_path = Path(__file__).parent / '.env'
+load_dotenv(dotenv_path=env_path)
 
 # Initialize Mistral client
 api_key = os.environ.get("MISTRAL_API_KEY")
 if not api_key:
-    raise ValueError("MISTRAL_API_KEY environment variable not set")
+    raise ValueError(
+        "Mistral API key not found. Please set MISTRAL_API_KEY environment variable "
+        "or add 'MISTRAL_API_KEY=your_key' to .env file in the project root."
+    )
 
 client = Mistral(api_key=api_key)
 
@@ -56,13 +193,9 @@ def create_batch_jsonl(pdf_files: List[str], output_file: str) -> None:
             entry = {
                 "custom_id": str(idx),
                 "body": {
-                    "model": "mistral-ocr-latest",
                     "document": {
-                        "type": "document_url",
                         "document_url": f"data:application/pdf;base64,{base64_pdf}"
-                    },
-                    "table_format": "html",
-                    "include_image_base64": True
+                    }
                 }
             }
             f.write(json.dumps(entry) + '\n')
@@ -117,10 +250,15 @@ def monitor_batch_job(job_id: str, check_interval: int = 5, max_wait_hours: int 
 def process_batch_results(
     job_id: str,
     pdf_files: List[str],
-    output_dir: Optional[str] = None
+    output_dir: Optional[str] = None,
+    failure_tracker: Optional[FailureTracker] = None
 ) -> Tuple[int, int]:
     """Download and process batch results."""
     logger.info(f"Processing results for batch job {job_id}")
+
+    # Initialize failure tracker if not provided
+    if failure_tracker is None:
+        failure_tracker = FailureTracker()
 
     # Download results file
     results_content = client.files.download(file_id=job_id)
@@ -140,8 +278,18 @@ def process_batch_results(
     # Process each PDF with its corresponding OCR result
     for idx, pdf_path in enumerate(pdf_files):
         custom_id = str(idx)
+        
+        # Validate PDF before processing
+        if not validate_pdf_file(pdf_path):
+            error_msg = f"PDF validation failed for {pdf_path}. Skipping to avoid wasting API credits."
+            logger.error(error_msg)
+            failure_tracker.report_failure(pdf_path, ValueError(error_msg), attempt=0)
+            failed += 1
+            continue
+            
         if custom_id not in results_by_id:
             logger.warning(f"No result found for PDF {idx}: {pdf_path}")
+            failure_tracker.report_failure(pdf_path, Exception("No result found in batch response"), attempt=0)
             failed += 1
             continue
 
@@ -150,7 +298,9 @@ def process_batch_results(
 
             # Extract the OCR response from the batch result
             if result.get('status') != 'succeeded':
-                logger.error(f"OCR failed for {pdf_path}: {result.get('error')}")
+                error_msg = result.get('error', 'Unknown batch processing error')
+                logger.error(f"OCR failed for {pdf_path}: {error_msg}")
+                failure_tracker.report_failure(pdf_path, Exception(error_msg), attempt=0)
                 failed += 1
                 continue
 
@@ -184,6 +334,7 @@ def process_batch_results(
 
         except Exception as e:
             logger.error(f"Error processing result for {pdf_path}: {e}")
+            failure_tracker.report_failure(pdf_path, e, attempt=0)
             failed += 1
 
     return successful, failed
@@ -205,7 +356,27 @@ def process_pdf_ocr(pdf_path: str) -> Dict[str, Any]:
     )
 
     # Convert response object to dict
-    return ocr_response.model_dump() if hasattr(ocr_response, 'model_dump') else ocr_response
+    response_dict = ocr_response.model_dump() if hasattr(ocr_response, 'model_dump') else ocr_response
+    
+    # Validate the OCR response
+    validate_ocr_response(response_dict, pdf_path)
+    
+    return response_dict
+
+
+def process_pdf_ocr_with_retry(pdf_path: str, failure_tracker: FailureTracker) -> Optional[Dict[str, Any]]:
+    """Call Mistral OCR API with retry logic and failure tracking."""
+    try:
+        return retry_api_call(
+            process_pdf_ocr,
+            max_retries=3,
+            base_delay=1.0,
+            max_delay=4.0,
+            pdf_path=pdf_path
+        )
+    except Exception as e:
+        failure_tracker.report_failure(pdf_path, e, attempt=3)
+        return None
 
 
 def save_ocr_results(pdf_path: str, ocr_response: Dict[str, Any]) -> str:
@@ -371,11 +542,26 @@ def merge_pdfs(original_pdf_path: str, ocr_pdf_buffer: BytesIO, output_pdf_path:
         merger.close()
 
 
-def process_pdf(pdf_path: str, output_dir: Optional[str] = None) -> bool:
+def process_pdf(pdf_path: str, output_dir: Optional[str] = None, failure_tracker: Optional[FailureTracker] = None) -> bool:
     """Process a single PDF: call OCR, save results, and merge."""
     try:
-        # Get OCR results
-        ocr_response = process_pdf_ocr(pdf_path)
+        # Initialize failure tracker if not provided
+        if failure_tracker is None:
+            failure_tracker = FailureTracker()
+
+        # Validate PDF before processing
+        if not validate_pdf_file(pdf_path):
+            error_msg = f"PDF validation failed for {pdf_path}. Skipping to avoid wasting API credits."
+            logger.error(error_msg)
+            failure_tracker.report_failure(pdf_path, ValueError(error_msg), attempt=0)
+            return False
+
+        # Get OCR results with retry logic
+        ocr_response = process_pdf_ocr_with_retry(pdf_path, failure_tracker)
+        
+        if ocr_response is None:
+            # OCR failed even after retries
+            return False
 
         # Save OCR results
         save_ocr_results(pdf_path, ocr_response)
@@ -397,6 +583,8 @@ def process_pdf(pdf_path: str, output_dir: Optional[str] = None) -> bool:
         return True
 
     except Exception as e:
+        if failure_tracker:
+            failure_tracker.report_failure(pdf_path, e, attempt=0)
         logger.error(f"Error processing {pdf_path}: {e}")
         return False
 
@@ -419,17 +607,38 @@ def process_directory(directory_path: str, output_dir: Optional[str] = None, rec
         logger.warning(f"No PDF files found in {directory_path}")
         return
 
-    logger.info(f"Found {len(pdf_files)} PDF file(s) to process (synchronous mode)")
+    # Filter out invalid PDFs before processing
+    valid_pdf_files = []
+    invalid_pdf_files = []
+    
+    for pdf_path in pdf_files:
+        if validate_pdf_file(str(pdf_path)):
+            valid_pdf_files.append(pdf_path)
+        else:
+            invalid_pdf_files.append(pdf_path)
+            logger.warning(f"Skipping invalid PDF: {pdf_path}")
+    
+    logger.info(f"Found {len(pdf_files)} PDF file(s), {len(valid_pdf_files)} valid, {len(invalid_pdf_files)} invalid")
 
+    # Initialize failure tracker
+    failure_tracker = FailureTracker()
+    
     successful = 0
     failed = 0
 
-    for pdf_path in pdf_files:
-        if process_pdf(str(pdf_path), output_dir):
+    for pdf_path in valid_pdf_files:
+        if process_pdf(str(pdf_path), output_dir, failure_tracker):
             successful += 1
         else:
             failed += 1
 
+    # Generate and log failure report
+    failure_tracker.log_summary()
+    
+    # Save failure report
+    report_path = os.path.join(directory_path, "failure_report.json")
+    failure_tracker.save_report(report_path)
+    
     logger.info(f"Processing complete: {successful} successful, {failed} failed")
 
 
@@ -470,7 +679,18 @@ def process_directory_batch(
         logger.warning(f"No PDF files found in {directory_path}")
         return
 
-    logger.info(f"Found {len(pdf_files)} PDF file(s) to process (batch mode)")
+    # Filter out invalid PDFs before processing
+    valid_pdf_files = []
+    invalid_pdf_files = []
+    
+    for pdf_path in pdf_files:
+        if validate_pdf_file(pdf_path):
+            valid_pdf_files.append(pdf_path)
+        else:
+            invalid_pdf_files.append(pdf_path)
+            logger.warning(f"Skipping invalid PDF: {pdf_path}")
+    
+    logger.info(f"Found {len(pdf_files)} PDF file(s), {len(valid_pdf_files)} valid, {len(invalid_pdf_files)} invalid")
 
     # If job_id is provided, skip batch creation and go straight to monitoring
     if job_id:
@@ -483,7 +703,7 @@ def process_directory_batch(
             batch_file = f.name
 
         try:
-            create_batch_jsonl(pdf_files, batch_file)
+            create_batch_jsonl(valid_pdf_files, batch_file)
 
             # Upload batch file
             batch_file_id = upload_batch_file(batch_file)
@@ -510,9 +730,125 @@ def process_directory_batch(
         logger.info(f"To resume later, use: python ocr_processor.py {directory_path} {output_dir or '.'} --batch --job-id {job_id}")
         return
 
+    # Initialize failure tracker
+    failure_tracker = FailureTracker()
+    
     # Process results
-    successful, failed = process_batch_results(job_id, pdf_files, output_dir)
+    successful, failed = process_batch_results(job_id, valid_pdf_files, output_dir, failure_tracker)
+    
+    # Generate and log failure report
+    failure_tracker.log_summary()
+    
+    # Save failure report
+    report_path = os.path.join(directory_path, "failure_report.json")
+    failure_tracker.save_report(report_path)
+    
     logger.info(f"Batch processing complete: {successful} successful, {failed} failed")
+
+
+def is_valid_pdf_file(path: str) -> bool:
+    """Check if path is a valid PDF file."""
+    try:
+        return Path(path).is_file() and path.lower().endswith('.pdf')
+    except Exception:
+        return False
+
+
+def validate_pdf_file(pdf_path: str) -> bool:
+    """
+    Validate that a PDF file can be opened and read.
+    
+    Args:
+        pdf_path: Path to PDF file
+        
+    Returns:
+        True if PDF is valid and can be opened, False otherwise
+        
+    Raises:
+        Exception: If there are issues reading the file
+    """
+    try:
+        # Check if file exists and has PDF extension
+        if not is_valid_pdf_file(pdf_path):
+            logger.warning(f"File {pdf_path} is not a valid PDF file")
+            return False
+            
+        # Try to open the PDF with PyPDF2 to validate it
+        with open(pdf_path, 'rb') as pdf_file:
+            try:
+                # Try to read the PDF - this will fail if PDF is corrupted
+                reader = PdfReader(pdf_file)
+                
+                # Check if we can get basic info (this validates the PDF structure)
+                if len(reader.pages) == 0:
+                    logger.warning(f"PDF {pdf_path} appears to be empty or have no pages")
+                    return False
+                    
+                return True
+                
+            except Exception as e:
+                logger.warning(f"Failed to read PDF {pdf_path}: {str(e)}")
+                return False
+                
+    except Exception as e:
+        logger.warning(f"Error validating PDF {pdf_path}: {str(e)}")
+        return False
+
+
+def validate_ocr_response(ocr_response: Dict[str, Any], pdf_path: str) -> None:
+    """
+    Validate OCR response to ensure it contains meaningful data.
+    
+    Args:
+        ocr_response: Response from OCR API
+        pdf_path: Path to the original PDF file
+        
+    Raises:
+        ValueError: If OCR response is invalid or empty
+    """
+    if not ocr_response:
+        raise ValueError(f"OCR API returned empty response for {pdf_path}")
+        
+    # Check for empty pages array
+    pages = ocr_response.get('pages', [])
+    if not pages or len(pages) == 0:
+        usage_info = ocr_response.get('usage_info', {})
+        doc_size = usage_info.get('doc_size_bytes', 'unknown')
+        pages_processed = usage_info.get('pages_processed', 0)
+        
+        error_msg = (
+            f"OCR API returned empty results for {pdf_path} "
+            f"(pages: [], document_size: {doc_size} bytes, "
+            f"pages_processed: {pages_processed}). "
+            f"This typically indicates a corrupted or unreadable PDF."
+        )
+        raise ValueError(error_msg)
+        
+    # Check if document_annotation is None (another sign of failure)
+    if ocr_response.get('document_annotation') is None:
+        error_msg = (
+            f"OCR API returned null document_annotation for {pdf_path}. "
+            f"This typically indicates the PDF could not be processed."
+        )
+        raise ValueError(error_msg)
+        
+    # Check for zero pages processed in usage info
+    usage_info = ocr_response.get('usage_info', {})
+    if usage_info.get('pages_processed', 0) == 0:
+        error_msg = (
+            f"OCR API processed 0 pages for {pdf_path} "
+            f"(document_size: {usage_info.get('doc_size_bytes', 'unknown')} bytes). "
+            f"This typically indicates a corrupted or unreadable PDF."
+        )
+        raise ValueError(error_msg)
+
+
+def is_valid_directory(path: str) -> bool:
+    """Check if path is a valid directory."""
+    try:
+        return Path(path).is_dir()
+    except Exception:
+        return False
 
 
 if __name__ == "__main__":
@@ -524,18 +860,27 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Synchronous mode (real-time, slower but immediate results)
+  # Process single PDF file (synchronous)
+  python ocr_processor.py document.pdf ./output
+
+  # Process directory of PDFs (synchronous)
   python ocr_processor.py ./pdfs ./output
 
-  # Batch mode (cost-effective, 50% savings, asynchronous)
+  # Process directory with batch mode (cost-effective, 50% savings)
   python ocr_processor.py ./pdfs ./output --batch
+
+  # Process single file with batch mode
+  python ocr_processor.py document.pdf ./output --batch
 
   # Resume a batch job
   python ocr_processor.py ./pdfs ./output --batch --job-id batch_123abc
         """
     )
 
-    parser.add_argument("directory", help="Directory containing PDFs to process")
+    parser.add_argument(
+        "input_path",
+        help="File or directory to process (PDF file or directory containing PDFs)"
+    )
     parser.add_argument(
         "output_dir",
         nargs="?",
@@ -571,14 +916,101 @@ Examples:
         logger.error("--job-id requires --batch flag")
         sys.exit(1)
 
-    if args.batch:
-        process_directory_batch(
-            args.directory,
-            args.output_dir,
-            recursive=True,
-            check_interval=args.check_interval,
-            max_wait_hours=args.max_wait_hours,
-            job_id=args.job_id
-        )
+    input_path = args.input_path
+
+    if is_valid_pdf_file(input_path):
+        # Process single file
+        logger.info(f"Processing single PDF file: {input_path}")
+        
+        # Initialize failure tracker
+        failure_tracker = FailureTracker()
+        
+        if args.batch:
+            # For batch mode with single file, we need to create a batch with just this file
+            pdf_files = [input_path]
+            
+            # Validate PDF before processing
+            if not validate_pdf_file(input_path):
+                error_msg = f"PDF validation failed for {input_path}. Skipping to avoid wasting API credits."
+                logger.error(error_msg)
+                failure_tracker.report_failure(input_path, ValueError(error_msg), attempt=0)
+                failure_tracker.log_summary()
+                report_path = os.path.join(os.path.dirname(input_path) or '.', "failure_report.json")
+                failure_tracker.save_report(report_path)
+                sys.exit(1)
+            
+            # Create batch file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
+                batch_file = f.name
+
+            try:
+                create_batch_jsonl(pdf_files, batch_file)
+
+                # Upload batch file
+                batch_file_id = upload_batch_file(batch_file)
+
+                # Create batch job
+                logger.info(f"Creating batch job for single PDF")
+                batch_job = client.batch.jobs.create(
+                    input_files=[batch_file_id],
+                    model="mistral-ocr-latest",
+                    endpoint="/v1/ocr"
+                )
+                logger.info(f"Batch job created with ID: {batch_job.id}")
+
+                # Monitor batch job
+                is_complete = monitor_batch_job(batch_job.id, args.check_interval, args.max_wait_hours)
+                
+                if is_complete:
+                    # Process results
+                    successful, failed = process_batch_results(
+                        batch_job.id, 
+                        pdf_files, 
+                        args.output_dir, 
+                        failure_tracker
+                    )
+                    
+                    # Generate and log failure report
+                    failure_tracker.log_summary()
+                    
+                    # Save failure report
+                    report_path = os.path.join(os.path.dirname(input_path) or '.', "failure_report.json")
+                    failure_tracker.save_report(report_path)
+                    
+                    logger.info(f"Single file batch processing complete: {successful} successful, {failed} failed")
+                else:
+                    logger.error("Single file batch processing did not complete successfully")
+            finally:
+                # Clean up temporary batch file
+                if os.path.exists(batch_file):
+                    os.remove(batch_file)
+        else:
+            # Synchronous processing for single file
+            if process_pdf(input_path, args.output_dir, failure_tracker):
+                logger.info(f"Successfully processed single file: {input_path}")
+                failure_tracker.log_summary()
+            else:
+                logger.error(f"Failed to process single file: {input_path}")
+                failure_tracker.log_summary()
+                
+                # Save failure report
+                report_path = os.path.join(os.path.dirname(input_path) or '.', "failure_report.json")
+                failure_tracker.save_report(report_path)
+
+    elif is_valid_directory(input_path):
+        # Process directory
+        logger.info(f"Processing directory: {input_path}")
+        if args.batch:
+            process_directory_batch(
+                input_path,
+                args.output_dir,
+                recursive=True,
+                check_interval=args.check_interval,
+                max_wait_hours=args.max_wait_hours,
+                job_id=args.job_id
+            )
+        else:
+            process_directory(input_path, args.output_dir, recursive=True)
     else:
-        process_directory(args.directory, args.output_dir, recursive=True)
+        logger.error(f"Invalid input: {input_path} is neither a PDF file nor a directory")
+        sys.exit(1)
